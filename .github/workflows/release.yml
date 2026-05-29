@@ -1,12 +1,20 @@
-name: Build & Release
+name: Build Windows EXE
 
+# دو حالت اجرا:
+#  1) هر push روی main / هر PR  → exe ساخته و به‌عنوان "Artifact" آپلود می‌شود
+#     (بدون نیاز به tag؛ از تب Actions قابل دانلود است).
+#  2) push یک tag مثل v1.0.0    → علاوه بر artifact، یک GitHub Release هم ساخته می‌شود.
+# می‌توان دستی هم از تب Actions اجرا کرد (workflow_dispatch).
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # برای ساختِ Release روی tag لازم است
 
 jobs:
   build:
@@ -23,39 +31,65 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller pydivert
+          pip install -r requirements.txt -r requirements-build.txt
 
-      - name: Download core binaries (Xray + Vwarp)
+      # باینری‌ها (xray.exe / vwarp.exe / wintun.dll / geoip / geosite) داخلِ repo
+      # هستند. این مرحله فقط اگر چیزی غایب باشد آن را دانلود می‌کند (fail-soft).
+      - name: Ensure core binaries
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/download_bins.py
-
-      - name: Build exe with PyInstaller
         run: |
-          pyinstaller --noconfirm --onefile --windowed ^
-            --name "SNI-Spoofer" ^
-            --add-data "bin;bin" ^
-            --add-data "config.json;." ^
-            --hidden-import core ^
-            --hidden-import core.xray_manager ^
-            --hidden-import core.vwarp_manager ^
-            --hidden-import core.binary_utils ^
-            gui.py
-        shell: cmd
+          if (-not (Test-Path "bin/xray.exe") -or -not (Test-Path "bin/vwarp.exe")) {
+            python scripts/download_bins.py
+          } else {
+            Write-Host "core binaries already present in repo; skipping download."
+          }
+        shell: pwsh
 
-      - name: Prepare release assets
+      - name: Generate icon
+        run: python scripts/make_icon.py
+
+      - name: Build exe (PyInstaller via spec)
+        run: python -m PyInstaller --clean --noconfirm SNISpoofer.spec
+
+      - name: Show build output
+        run: |
+          Get-ChildItem dist
+          $exe = "dist/SNISpoofer.exe"
+          if (Test-Path $exe) {
+            $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+            Write-Host "built $exe ($mb MB)"
+          } else {
+            Write-Error "dist/SNISpoofer.exe not found"
+            exit 1
+          }
+        shell: pwsh
+
+      # روی هر اجرا (push/PR/دستی) → دانلودِ مستقیم از تب Actions
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SNISpoofer-windows-x64
+          path: dist/SNISpoofer.exe
+          if-no-files-found: error
+
+      # فقط وقتی یک tag مثل v1.0.0 push شود → ساختِ Release با zip
+      - name: Package release zip
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir release
-          Copy-Item dist\SNI-Spoofer.exe release\
-          Copy-Item config.json release\
-          Copy-Item LICENSE release\
-          Compress-Archive -Path release\* -DestinationPath "SNI-Spoofer-${{ github.ref_name }}-windows-x64.zip"
+          Copy-Item dist/SNISpoofer.exe release/
+          Copy-Item config.json release/ -ErrorAction SilentlyContinue
+          Copy-Item LICENSE release/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path release/* -DestinationPath "SNISpoofer-${{ github.ref_name }}-windows-x64.zip"
+        shell: pwsh
 
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           name: "SNI Spoofer ${{ github.ref_name }}"
           generate_release_notes: true
           files: |
-            SNI-Spoofer-${{ github.ref_name }}-windows-x64.zip
-            dist/SNI-Spoofer.exe
+            SNISpoofer-${{ github.ref_name }}-windows-x64.zip
+            dist/SNISpoofer.exe
